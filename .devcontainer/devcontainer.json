@@ -1,0 +1,11 @@
+{
+  "name": "Go",
+  "image": "golang:1.27",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go"
+      ]
+    }
+  }
+}
