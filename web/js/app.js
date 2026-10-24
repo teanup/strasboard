@@ -1,3 +1,11 @@
+// API base URL, configurable via config.js (window.STRASBOARD_API_URL).
+// Empty string means same origin as the page.
+const API_BASE = (window.STRASBOARD_API_URL ?? '').replace(/\/$/, '');
+
+function apiURL(path) {
+  return API_BASE + path;
+}
+
 // Tariff helpers
 function toSegments(entry) {
   return Object.entries(entry)
@@ -10,15 +18,29 @@ function entryTotal(entry) {
 }
 
 // Response parsing
-function parseResponse(resp, transform) {
-  const data = resp?.data ? transform(resp.data) : null;
-  const error = resp?.error || (!data ? 'No data' : null);
-  return { data, error };
+//
+// The API returns each resource as { items: [{id, data, updated_at}], updated_at, error }.
+// These helpers unwrap that shape into the flat structures the widgets expect.
+
+// resourceItems returns the data payloads of a resource's items.
+function resourceItems(resource) {
+  return (resource?.items ?? []).map((item) => item.data);
 }
 
-const parseWeather = (resp) => parseResponse(resp, (d) => {
-  return formatWeather(d.current ?? null, d.hourly ?? [], d.daily ?? []);
-});
+// resourceError returns the resource error, or a fallback when it has no items.
+function resourceError(resource, hasData) {
+  return resource?.error || (!hasData ? 'No data' : null);
+}
+
+const parseWeather = (all) => {
+  const resource = all.weather;
+  const data = resourceItems(resource)[0];
+  if (!data) return { data: null, error: resourceError(resource, false) };
+  return {
+    data: formatWeather(data.current ?? null, data.hourly ?? [], data.daily ?? []),
+    error: resourceError(resource, true),
+  };
+};
 
 const SKY_VARS = Object.fromEntries([
   ...[0, 1].map(c => [c, 'transparent']),
@@ -116,28 +138,48 @@ function formatWeather(current, hourly, daily) {
   return { current, graph, forecast };
 }
 
-const parseTemperature = (resp) => parseResponse(resp, (d) => ({
-  temperature: d.temperature,
-  humidity: d.humidity,
-  location: d.location ?? null,
-}));
+const parseTemperature = (all) => {
+  const resource = all.temperature;
+  const data = resourceItems(resource)[0];
+  if (!data) return { data: null, error: resourceError(resource, false) };
+  return {
+    data: {
+      temperature: data.temperature,
+      humidity: data.humidity,
+      location: data.location ?? null,
+    },
+    error: resourceError(resource, true),
+  };
+};
 
-const parseTransport = (resp) => parseResponse(resp, (d) => ({
-  stops: (d.stops ?? []).flatMap((stop) =>
-    (stop.destinations?.length ? stop.destinations : [{ name: '', departures: [] }])
-      .map((dest) => ({
-        id: stop.id,
-        stop: stop.name,
-        line: stop.line,
-        color: stop.color,
-        colorText: stop.color_text,
-        destination: dest.name,
-        departures: dest.departures ?? [],
-      }))
-  ),
-}));
+const parseTransport = (all) => {
+  const resource = all.transport;
+  const stops = resourceItems(resource);
+  if (!stops.length) return { data: null, error: resourceError(resource, false) };
+  return {
+    data: {
+      stops: stops.flatMap((stop) =>
+        (stop.destinations?.length ? stop.destinations : [{ name: '', departures: [] }])
+          .map((dest) => ({
+            id: stop.id,
+            stop: stop.name,
+            line: stop.line,
+            color: stop.color,
+            colorText: stop.color_text,
+            destination: dest.name,
+            departures: dest.departures ?? [],
+          }))
+      ),
+    },
+    error: resourceError(resource, true),
+  };
+};
 
-function parseElectricity(resp) {
+function parseElectricity(all) {
+  const resource = all.electricity;
+  const data = resourceItems(resource)[0];
+  if (!data) return { data: null, error: resourceError(resource, false) };
+
   const normalize = (entry) => ({
     date: entry.date,
     hp: entry.HP ?? 0, hc: entry.HC ?? 0,
@@ -146,11 +188,12 @@ function parseElectricity(resp) {
     buhp: entry.BUHP ?? 0, buhc: entry.BUHC ?? 0,
   });
 
-  return parseResponse(resp, (d) => {
-    const days = (d.days ?? []).slice(-14).map(normalize);
-    const months = (d.months ?? []).slice(-2).map(normalize);
-    return formatElectricity(months, days);
-  });
+  const days = (data.days ?? []).slice(-14).map(normalize);
+  const months = (data.months ?? []).slice(-2).map(normalize);
+  return {
+    data: formatElectricity(months, days),
+    error: resourceError(resource, true),
+  };
 }
 
 function formatElectricity(months, days) {
@@ -194,12 +237,19 @@ function formatElectricity(months, days) {
   return { monthBars, monthMax, dayGroups, dayMax, legend };
 }
 
-const parseTempo = (resp) => parseResponse(resp, (d) => {
+const parseTempo = (all) => {
+  const resource = all.tempo;
+  const days = resourceItems(resource);
+  if (!days.length) return { data: null, error: resourceError(resource, false) };
+
   const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Paris' });
   const tomorrow = new Date(Date.now() + 86400000).toLocaleDateString('en-CA', { timeZone: 'Europe/Paris' });
-  const find = (date) => (d ?? []).find((t) => t.date === date)?.color ?? null;
-  return { today: find(today), tomorrow: find(tomorrow) };
-});
+  const find = (date) => days.find((t) => t.date === date)?.color ?? null;
+  return {
+    data: { today: find(today), tomorrow: find(tomorrow) },
+    error: resourceError(resource, true),
+  };
+};
 
 
 document.addEventListener('alpine:init', () => {
@@ -221,13 +271,13 @@ document.addEventListener('alpine:init', () => {
 
     async refresh() {
       try {
-        const all = await fetch('/api/all').then(r => r.json());
+        const all = await fetch(apiURL('/api/v1/all')).then(r => r.json());
         this.timestamp = all.timestamp;
-        this.weather = parseWeather(all.weather);
-        this.temperature = parseTemperature(all.temperature);
-        this.transport = parseTransport(all.transport);
-        this.electricity = parseElectricity(all.electricity);
-        this.tempo = parseTempo(all.tempo);
+        this.weather = parseWeather(all);
+        this.temperature = parseTemperature(all);
+        this.transport = parseTransport(all);
+        this.electricity = parseElectricity(all);
+        this.tempo = parseTempo(all);
       } catch (e) {
         console.error('Fetch failed:', e);
       }
@@ -235,11 +285,11 @@ document.addEventListener('alpine:init', () => {
 
     async refreshStop(stopId) {
       try {
-        const result = await fetch(`/api/transport/live?id=${stopId}`).then(r => r.json());
-        if (result?.data?.destinations) {
+        const stop = await fetch(apiURL(`/api/v1/transport/live?id=${stopId}`)).then(r => r.json());
+        if (stop?.destinations) {
           this.transport.data?.stops?.forEach((row) => {
             if (row.id !== stopId) return;
-            const match = result.data.destinations.find((d) => d.name === row.destination);
+            const match = stop.destinations.find((d) => d.name === row.destination);
             if (match) row.departures = match.departures ?? [];
           });
         }
