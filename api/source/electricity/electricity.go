@@ -1,4 +1,4 @@
-package main
+package electricity
 
 import (
 	"crypto/rand"
