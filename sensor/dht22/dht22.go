@@ -1,6 +1,21 @@
-// Package dht22 reads temperature and humidity from a DHT22 (AM2302)
-// sensor connected to a single GPIO data pin via periph.io.
-// Inspired by go-dht (https://github.com/MichaelS11/go-dht).
+// Package dht22 reads temperature and humidity from a DHT22 (AM2302) sensor
+// connected to a single GPIO data pin via periph.io.
+//
+// Derived from go-dht (https://github.com/MichaelS11/go-dht), MIT licensed:
+//
+//	MIT License
+//
+//	Copyright (c) 2018 MichaelS11
+//
+//	Permission is hereby granted, free of charge, to any person obtaining a copy
+//	of this software and associated documentation files (the "Software"), to deal
+//	in the Software without restriction, including without limitation the rights
+//	to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//	copies of the Software, and to permit persons to whom the Software is
+//	furnished to do so, subject to the following conditions:
+//
+//	The above copyright notice and this permission notice shall be included in all
+//	copies or substantial portions of the Software.
 package dht22
 
 import (
@@ -15,19 +30,19 @@ import (
 
 // Protocol timing constants per the AM2302 datasheet.
 const (
-	startLowDuration = 1 * time.Millisecond  // host pulls LOW for ≥1 ms
-	bitThreshold     = 30 * time.Microsecond // HIGH > 30 µs ⇒ bit 1
+	startLowDuration = 1 * time.Millisecond  // host pulls LOW for >= 1 ms
+	bitThreshold     = 30 * time.Microsecond // HIGH > 30 µs is a 1 bit
 	maxHighPulse     = 90 * time.Microsecond
 	maxLowPulse      = 70 * time.Microsecond
 	minLowPulse      = 35 * time.Microsecond
-	transitionCount  = 84 // 2 ack + 40 bits × 2 edges
+	transitionCount  = 84 // 2 ack + 40 bits * 2 edges
 	minReadInterval  = 2 * time.Second
 )
 
 // Reading holds a single sensor measurement.
 type Reading struct {
-	Humidity    float64 // relative humidity, 0–100 %
-	Temperature float64 // degrees Celsius, -40–80
+	Humidity    float64 // relative humidity, 0% - 100%
+	Temperature float64 // room temperature, -40°C - 80°C
 }
 
 // Sensor controls a DHT22 on a single GPIO pin.
@@ -102,7 +117,7 @@ func (s *Sensor) sample() ([]int, error) {
 	return decode(levels, durations)
 }
 
-// startSignal sends the host start pulse: pull LOW for ≥1 ms, then
+// startSignal sends the host start pulse: pull LOW for >= 1 ms, then
 // release the line with an internal pull-up.
 func (s *Sensor) startSignal() error {
 	if err := s.pin.Out(gpio.Low); err != nil {
@@ -136,7 +151,7 @@ func (s *Sensor) capture() ([]gpio.Level, []time.Duration) {
 
 // decode extracts 40 data bits from raw level transitions.
 func decode(levels []gpio.Level, durations []time.Duration) ([]int, error) {
-	// Find the last LOW transition — marks the end of the 40th bit.
+	// Find the last LOW transition, marks the end of the 40th bit.
 	end := -1
 	for i := len(levels) - 1; i >= 80; i-- {
 		if levels[i] == gpio.Low {
@@ -178,9 +193,9 @@ func decode(levels []gpio.Level, durations []time.Duration) ([]int, error) {
 //
 // Bit layout (MSB first):
 //
-//	[0–15]  humidity × 10   (unsigned)
-//	[16–31] temperature × 10 (bit 15 = sign)
-//	[32–39] checksum         (sum of preceding 4 bytes)
+//	[0 - 15]  humidity * 10    (unsigned)
+//	[16 - 31] temperature * 10 (bit 15 = sign)
+//	[32 - 39] checksum         (sum of preceding 4 bytes)
 func parse(bits []int) (Reading, error) {
 	var b [5]byte
 	for i := range 5 {

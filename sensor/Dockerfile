@@ -1,14 +1,26 @@
-# Build
-FROM golang:1.25-alpine AS build
-WORKDIR /src
-COPY go.mod go.sum* ./
-RUN go mod download
-COPY *.go ./
-COPY dht22/ dht22/
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /app
+# syntax=docker/dockerfile:1
+FROM --platform=${BUILDPLATFORM} golang:1.27 AS builder
 
-# Run
+ARG VERSION=dev
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /app
+
+COPY go.mod go.sum .
+RUN --mount=type=cache,target=/go/pkg/mod \
+  go mod download
+
+COPY --parents main.go */* .
+RUN --mount=type=cache,target=/go/pkg/mod \
+  --mount=type=cache,target=/root/.cache/go-build \
+  GOOS=${TARGETOS} GOARCH=${TARGETARCH} CGO_ENABLED=0 \
+  go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o sensor
+
 FROM scratch
-COPY --from=build /app /app
-EXPOSE $PORT
-ENTRYPOINT ["/app"]
+
+COPY --from=builder /app/sensor /strasboard-sensor
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY config.json /etc/strasboard/sensor.json
+
+ENV CONFIG_PATH=/etc/strasboard/sensor.json
+ENTRYPOINT ["/strasboard-sensor"]
