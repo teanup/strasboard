@@ -1,6 +1,13 @@
-// API base URL, configurable via config.js (window.STRASBOARD_API_URL).
-// Empty string means same origin as the page.
-const API_BASE = (window.STRASBOARD_API_URL ?? '').replace(/\/$/, '');
+// Default API base URL. Override with ?api=<url> (e.g. ?api=http://localhost:8080
+// for local development). An empty value means same origin as the page.
+const DEFAULT_API_URL = 'https://api.strasboard.lag.tf';
+
+const params = new URLSearchParams(location.search);
+
+// demo mode serves generated data instead of calling the API.
+const DEMO = params.has('demo');
+
+const API_BASE = (params.get('api') ?? DEFAULT_API_URL).replace(/\/$/, '');
 
 function apiURL(path) {
   return API_BASE + path;
@@ -9,7 +16,11 @@ function apiURL(path) {
 // fetchResource fetches a single resource collection. The browser's HTTP cache
 // honours the API's Cache-Control headers, so repeated polls within the
 // freshness window are served locally without hitting the network.
+//
+// In demo mode it returns generated data instead.
 async function fetchResource(name) {
+  if (DEMO) return demoResource(name);
+
   const res = await fetch(apiURL(`/api/v1/${name}`));
   if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
   return res.json();
@@ -315,9 +326,11 @@ document.addEventListener('alpine:init', () => {
 
     async refreshStop(stopId) {
       try {
-        const item = await fetch(apiURL(`/api/v1/transport/${stopId}/refresh`), {
-          method: 'POST',
-        }).then(r => r.json());
+        const item = DEMO
+          ? demoResource('transport').items.find((i) => i.id === String(stopId))
+          : await fetch(apiURL(`/api/v1/transport/${stopId}/refresh`), {
+              method: 'POST',
+            }).then(r => r.json());
         const stop = item?.data;
         if (stop?.destinations) {
           this.transport.data?.stops?.forEach((row) => {
