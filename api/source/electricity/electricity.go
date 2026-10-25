@@ -29,8 +29,11 @@ const refreshHour = 1
 // retryInterval is how long to wait before retrying when data is missing.
 const retryInterval = 1 * time.Hour
 
-// currentID is the fixed item ID for this single-document resource.
-const currentID = "current"
+// Item IDs for the two consumption series.
+const (
+	daysID   = "days"
+	monthsID = "months"
+)
 
 // Source fetches electricity consumption from the SER API.
 type Source struct {
@@ -103,7 +106,8 @@ func (s *Source) hasYesterday(now time.Time) bool {
 	return s.lastData.Days[len(s.lastData.Days)-1].Date >= yesterday
 }
 
-// Refresh fetches consumption data and returns it as a single item.
+// Refresh fetches consumption data and returns the daily and monthly series
+// as separate items.
 func (s *Source) Refresh(_ context.Context) (map[string]any, error) {
 	if s.username == "" || s.password == "" {
 		return nil, fmt.Errorf("electricity not configured")
@@ -118,7 +122,10 @@ func (s *Source) Refresh(_ context.Context) (map[string]any, error) {
 	s.lastData = data
 	s.mu.Unlock()
 
-	return map[string]any{currentID: data}, nil
+	return map[string]any{
+		daysID:   data.Days,
+		monthsID: data.Months,
+	}, nil
 }
 
 // fetchData fetches consumption once authenticated.

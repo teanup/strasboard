@@ -16,8 +16,12 @@ import (
 // apiURL is the Open-Meteo forecast endpoint.
 const apiURL = "https://api.open-meteo.com/v1/forecast"
 
-// currentID is the fixed item ID for this single-document resource.
-const currentID = "current"
+// Item IDs for the three forecast parts.
+const (
+	currentID = "current"
+	hourlyID  = "hourly"
+	dailyID   = "daily"
+)
 
 // Each part of the forecast changes at a different rate, so it is cached and
 // refreshed independently.
@@ -92,13 +96,7 @@ func expiry[T any](p *part[T], now time.Time) time.Time {
 	return p.expiresAt
 }
 
-// Data is the weather payload returned by the API.
-type Data struct {
-	Current Current `json:"current"`
-	Hourly  []Hour  `json:"hourly"`
-	Daily   []Day   `json:"daily"`
-}
-
+// Current is the current-conditions item payload.
 type Current struct {
 	Time        string  `json:"time"`
 	Temperature float64 `json:"temperature"`
@@ -107,6 +105,7 @@ type Current struct {
 	Code        int     `json:"code"`
 }
 
+// Hour is a single hourly forecast entry.
 type Hour struct {
 	Time        string  `json:"time"`
 	Temperature float64 `json:"temperature"`
@@ -115,6 +114,7 @@ type Hour struct {
 	Code        int     `json:"code"`
 }
 
+// Day is a single daily forecast entry.
 type Day struct {
 	Date    string  `json:"date"`
 	TempMax float64 `json:"temp_max"`
@@ -122,8 +122,8 @@ type Day struct {
 	Code    int     `json:"code"`
 }
 
-// Refresh fetches the forecast parts whose TTL has expired and returns the
-// combined forecast as a single item.
+// Refresh fetches the forecast parts whose TTL has expired and returns one
+// item per part: current, hourly and daily.
 func (s *Source) Refresh(_ context.Context) (map[string]any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -152,12 +152,11 @@ func (s *Source) Refresh(_ context.Context) (map[string]any, error) {
 		s.daily = &part[[]Day]{data: daily, expiresAt: now.Add(dailyTTL)}
 	}
 
-	data := Data{
-		Current: s.current.data,
-		Hourly:  filterHourly(s.hourly.data, s.loc),
-		Daily:   filterDaily(s.daily.data, s.loc),
-	}
-	return map[string]any{currentID: data}, nil
+	return map[string]any{
+		currentID: s.current.data,
+		hourlyID:  filterHourly(s.hourly.data, s.loc),
+		dailyID:   filterDaily(s.daily.data, s.loc),
+	}, nil
 }
 
 // fetchCurrent fetches 15-minutely data and picks the slot closest to now.

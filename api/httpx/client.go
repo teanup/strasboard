@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"time"
@@ -64,9 +65,7 @@ func request(method, reqURL string, body []byte, contentType string, headers htt
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
-	for k, v := range headers {
-		req.Header[k] = v
-	}
+	maps.Copy(req.Header, headers)
 	for _, c := range cookies {
 		req.AddCookie(c)
 	}

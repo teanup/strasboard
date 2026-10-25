@@ -18,8 +18,13 @@ type Scheduler struct {
 	resources []source.Resource
 }
 
-// New returns a Scheduler that publishes refreshed data into st.
-func New(st *store.Store, resources ...source.Resource) *Scheduler {
+// New returns a Scheduler that publishes refreshed data into st. Every
+// resource's next-refresh function is registered with schedule so the HTTP
+// layer can derive cache lifetimes.
+func New(st *store.Store, schedule *Schedule, resources ...source.Resource) *Scheduler {
+	for _, r := range resources {
+		schedule.Register(r.Name(), r.NextRefresh)
+	}
 	return &Scheduler{store: st, resources: resources}
 }
 

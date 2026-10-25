@@ -58,12 +58,13 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	scheduler := jobs.New(st, resources...)
+	schedule := jobs.NewSchedule()
+	scheduler := jobs.New(st, schedule, resources...)
 	go scheduler.Run(ctx)
 
 	go snapshotLoop(ctx, st, cfg)
 
-	srv := server.New(cfg, st, tr)
+	srv := server.New(cfg, st, schedule, resources...)
 	httpServer := &http.Server{
 		Addr:    ":" + strconv.Itoa(port),
 		Handler: srv.Handler(),

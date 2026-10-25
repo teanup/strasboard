@@ -4,8 +4,13 @@ package source
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+// ErrNotFound is returned by ItemRefresher implementations when the requested
+// item does not exist upstream. The HTTP layer maps it to 404.
+var ErrNotFound = errors.New("not found")
 
 // Resource is a named, refreshable collection of items.
 //
@@ -25,4 +30,14 @@ type Resource interface {
 	// itself. Returning an error leaves the previously stored items in place
 	// (degraded mode).
 	Refresh(ctx context.Context) (map[string]any, error)
+}
+
+// ItemRefresher is implemented by resources that can re-fetch a single item on
+// demand, bypassing the regular schedule. It powers
+// POST /api/v1/{resource}/{id}/refresh.
+//
+// The returned value is the refreshed item payload, which the caller stores
+// under the same ID. Returning an error leaves the stored item untouched.
+type ItemRefresher interface {
+	RefreshItem(ctx context.Context, id string) (any, error)
 }

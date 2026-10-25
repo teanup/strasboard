@@ -3,7 +3,7 @@
   "location": "Living Room",
   "server_url": "https://api.strasboard.lag.tf/api/v1/temperature",
   "auth_token": "",
-  "read_interval_seconds": 5,
+  "read_interval_seconds": 120,
   "max_retries": 11,
   "debug": false
 }

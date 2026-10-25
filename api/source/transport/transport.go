@@ -15,6 +15,7 @@ import (
 
 	"strasboard/api/config"
 	"strasboard/api/httpx"
+	"strasboard/api/source"
 )
 
 // apiURL is the CTS SIRI endpoint.
@@ -134,9 +135,19 @@ func (s *Source) RefreshStop(id int) (Stop, error) {
 		return Stop{}, fmt.Errorf("resolve: %w", err)
 	}
 	if id < 0 || id >= len(s.stops) || s.stops[id].stopRef == "" {
-		return Stop{}, fmt.Errorf("invalid stop")
+		return Stop{}, fmt.Errorf("invalid stop: %w", source.ErrNotFound)
 	}
 	return s.fetchStop(id)
+}
+
+// RefreshItem implements source.ItemRefresher. The id is the stop index as a
+// string, matching the IDs used by Refresh.
+func (s *Source) RefreshItem(_ context.Context, id string) (any, error) {
+	n, err := strconv.Atoi(id)
+	if err != nil {
+		return nil, fmt.Errorf("invalid id: %w", source.ErrNotFound)
+	}
+	return s.RefreshStop(n)
 }
 
 // ensureResolved resolves stop references once, on first use.

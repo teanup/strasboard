@@ -3,28 +3,49 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
-	"strconv"
+	"strings"
 	"time"
 
 	"strasboard/api/config"
+	"strasboard/api/jobs"
+	"strasboard/api/source"
 	"strasboard/api/source/temperature"
-	"strasboard/api/source/transport"
 	"strasboard/api/store"
 )
 
 // Server holds the HTTP dependencies shared by all handlers.
 type Server struct {
-	cfg       *config.Config
-	store     *store.Store
-	transport *transport.Source
+	cfg      *config.Config
+	store    *store.Store
+	schedule *jobs.Schedule
+	// refreshers maps a resource name to its on-demand item refresher, when
+	// the source implements source.ItemRefresher.
+	refreshers map[string]source.ItemRefresher
 }
 
-// New builds a Server from the given config, store and transport source.
-// The transport source is used by the live-refresh endpoint; it may be nil.
-func New(cfg *config.Config, st *store.Store, tr *transport.Source) *Server {
-	return &Server{cfg: cfg, store: st, transport: tr}
+// New builds a Server from the given config, store, schedule and resources.
+// Resources that implement source.ItemRefresher gain the
+// POST /api/v1/{resource}/{id}/refresh endpoint.
+//
+// Every resource is pre-registered in the store so that reads of a
+// not-yet-populated resource return an empty collection rather than 404.
+func New(cfg *config.Config, st *store.Store, schedule *jobs.Schedule, resources ...source.Resource) *Server {
+	refreshers := make(map[string]source.ItemRefresher)
+	for _, r := range resources {
+		st.Ensure(r.Name())
+		if ir, ok := r.(source.ItemRefresher); ok {
+			refreshers[r.Name()] = ir
+		}
+	}
+	// Temperature is pushed by the sensor, not fetched by a job, so it has no
+	// source in the resources list.
+	st.Ensure(temperature.ResourceName)
+
+	return &Server{cfg: cfg, store: st, schedule: schedule, refreshers: refreshers}
 }
 
 // Handler returns the root HTTP handler with all routes registered.
@@ -32,20 +53,18 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /health", s.handleHealth)
-	mux.HandleFunc("GET /api/v1/all", s.handleAll)
 
-	// Derived endpoints must be registered before the generic {id} route.
-	mux.HandleFunc("GET /api/v1/temperature/current", s.handleTemperatureCurrent)
-	mux.HandleFunc("GET /api/v1/transport/live", s.handleTransportLive)
-
-	// Generic CRUD over every resource.
+	// Generic REST CRUD over every resource.
 	mux.HandleFunc("GET /api/v1/{resource}", s.handleList)
 	mux.HandleFunc("POST /api/v1/{resource}", s.handleCreate)
 	mux.HandleFunc("GET /api/v1/{resource}/{id}", s.handleGet)
 	mux.HandleFunc("PUT /api/v1/{resource}/{id}", s.handlePut)
 	mux.HandleFunc("DELETE /api/v1/{resource}/{id}", s.handleDelete)
 
-	return s.withCORS(mux)
+	// On-demand refresh of a single item, for resources that support it.
+	mux.HandleFunc("POST /api/v1/{resource}/{id}/refresh", s.handleRefresh)
+
+	return s.withCORS(s.withCache(mux))
 }
 
 // withCORS applies the configured CORS policy to every response.
@@ -62,6 +81,9 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			// Expose validators so cross-origin clients can use conditional
+			// requests and read the freshness window.
+			w.Header().Set("Access-Control-Expose-Headers", "ETag, Last-Modified, Cache-Control")
 		}
 
 		if r.Method == http.MethodOptions {
@@ -72,87 +94,95 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 	})
 }
 
+// withCache sets Cache-Control, ETag and Last-Modified on successful GET
+// responses, and answers conditional requests with 304 Not Modified.
+//
+// The freshness window comes from the resource's NextRefresh schedule: the
+// server already knows when the data will change, so it tells clients exactly
+// how long they can reuse it without re-fetching.
+//
+// It runs before the mux, so it extracts the resource name from the URL path
+// rather than relying on r.PathValue (which is only populated after routing).
+func (s *Server) withCache(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		name := resourceFromPath(r.URL.Path)
+		if name == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Only cache reads of resources we actually know about.
+		meta, ok := s.store.Meta(name)
+		if !ok {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		now := time.Now()
+		etag := etagFor(meta.UpdatedAt)
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Last-Modified", meta.UpdatedAt.UTC().Format(http.TimeFormat))
+
+		if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		if since := r.Header.Get("If-Modified-Since"); since != "" && !meta.UpdatedAt.IsZero() {
+			if t, err := http.ParseTime(since); err == nil && !meta.UpdatedAt.After(t) {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+		}
+
+		// A degraded resource may recover at any moment, so do not let clients
+		// cache it for long.
+		maxAge := s.schedule.MaxAge(name, now)
+		if meta.Error != "" {
+			maxAge = 0
+		}
+		w.Header().Set("Cache-Control", cacheControl(maxAge))
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// resourceFromPath extracts the resource name from an /api/v1/{resource}...
+// path. It returns "" for any other path.
+func resourceFromPath(path string) string {
+	const prefix = "/api/v1/"
+	if !strings.HasPrefix(path, prefix) {
+		return ""
+	}
+	rest := path[len(prefix):]
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		rest = rest[:i]
+	}
+	return rest
+}
+
+// cacheControl renders a Cache-Control value for a freshness window. Windows
+// shorter than a second are rounded up to one second so clients still get a
+// small reuse benefit; the value is always floored to whole seconds.
+func cacheControl(maxAge time.Duration) string {
+	secs := max(int(maxAge/time.Second), 1)
+	return fmt.Sprintf("public, max-age=%d", secs)
+}
+
+// etagFor derives a weak ETag from a resource's last update time.
+func etagFor(updatedAt time.Time) string {
+	return fmt.Sprintf(`W/"%d"`, updatedAt.UnixNano())
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status":    "ok",
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	})
-}
-
-// handleAll returns every resource in a single payload, keyed by resource name.
-func (s *Server) handleAll(w http.ResponseWriter, _ *http.Request) {
-	result := make(map[string]any)
-	for _, name := range s.store.Resources() {
-		items, meta, _ := s.store.List(name)
-		result[name] = map[string]any{
-			"items":      items,
-			"updated_at": meta.UpdatedAt,
-			"error":      meta.Error,
-		}
-	}
-	result["timestamp"] = time.Now().UTC().Format(time.RFC3339)
-	writeJSON(w, http.StatusOK, result)
-}
-
-// handleTemperatureCurrent returns the aggregated current indoor reading,
-// derived from the most recent stored readings.
-func (s *Server) handleTemperatureCurrent(w http.ResponseWriter, _ *http.Request) {
-	items, _, ok := s.store.List(temperature.ResourceName)
-	if !ok {
-		writeError(w, http.StatusNotFound, "no sensor data")
-		return
-	}
-
-	readings := make([]temperature.Reading, 0, len(items))
-	for _, item := range items {
-		// Items may be stored as typed values (from a snapshot) or as generic
-		// maps (from a JSON request body), so decode through JSON to normalize.
-		var r temperature.Reading
-		if err := decodeInto(item.Data, &r); err != nil {
-			continue
-		}
-		readings = append(readings, r)
-	}
-
-	current, ok := temperature.Aggregate(readings)
-	if !ok {
-		writeError(w, http.StatusNotFound, "no sensor data")
-		return
-	}
-	writeJSON(w, http.StatusOK, current)
-}
-
-// decodeInto re-encodes v and decodes it into dest, normalizing between typed
-// values and generic JSON maps.
-func decodeInto(v any, dest any) error {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(data, dest)
-}
-
-// handleTransportLive re-fetches a single stop on demand and updates the store.
-func (s *Server) handleTransportLive(w http.ResponseWriter, r *http.Request) {
-	if s.transport == nil {
-		writeError(w, http.StatusNotFound, "transport not configured")
-		return
-	}
-
-	id, err := strconv.Atoi(r.URL.Query().Get("id"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid id")
-		return
-	}
-
-	stop, err := s.transport.RefreshStop(id)
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
-	}
-
-	s.store.Set(transport.ResourceName, strconv.Itoa(id), stop)
-	writeJSON(w, http.StatusOK, stop)
 }
 
 // handleList returns all items of a resource.
@@ -166,8 +196,24 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"items":      items,
 		"updated_at": meta.UpdatedAt,
-		"error":      meta.Error,
+		"error":      s.resourceError(name, items, meta),
 	})
+}
+
+// resourceError returns the error to report for a resource read. It combines
+// the stored degraded-mode error with any time-based staleness policy.
+func (s *Server) resourceError(name string, items []store.Item, meta store.Resource) string {
+	if meta.Error != "" {
+		return meta.Error
+	}
+	if name == temperature.ResourceName && len(items) > 0 {
+		// Items are sorted by ID; the last one is the newest reading.
+		newest := items[len(items)-1].UpdatedAt
+		if temperature.Stale(newest, time.Now().UTC()) {
+			return temperature.StaleError
+		}
+	}
+	return ""
 }
 
 // handleGet returns a single item.
@@ -199,6 +245,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.store.Set(name, body.ID, body.Data)
+	s.applyRetention(name)
 	item, _ := s.store.Get(name, body.ID)
 	writeJSON(w, http.StatusCreated, item)
 }
@@ -214,8 +261,16 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.store.Set(name, id, data)
+	s.applyRetention(name)
 	item, _ := s.store.Get(name, id)
 	writeJSON(w, http.StatusOK, item)
+}
+
+// applyRetention prunes a resource to its configured size after a write.
+func (s *Server) applyRetention(name string) {
+	if name == temperature.ResourceName {
+		s.store.Prune(name, temperature.Window)
+	}
 }
 
 // handleDelete removes an item.
@@ -225,6 +280,33 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleRefresh re-fetches a single item from its upstream source and stores
+// the result. It is only available for resources that implement
+// source.ItemRefresher.
+func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	name, id := r.PathValue("resource"), r.PathValue("id")
+
+	refresher, ok := s.refreshers[name]
+	if !ok {
+		writeError(w, http.StatusMethodNotAllowed, "resource does not support refresh")
+		return
+	}
+
+	data, err := refresher.RefreshItem(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, source.ErrNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	s.store.Set(name, id, data)
+	item, _ := s.store.Get(name, id)
+	writeJSON(w, http.StatusOK, item)
 }
 
 // writeJSON encodes data as JSON with the given status code.

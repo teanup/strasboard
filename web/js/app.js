@@ -6,6 +6,15 @@ function apiURL(path) {
   return API_BASE + path;
 }
 
+// fetchResource fetches a single resource collection. The browser's HTTP cache
+// honours the API's Cache-Control headers, so repeated polls within the
+// freshness window are served locally without hitting the network.
+async function fetchResource(name) {
+  const res = await fetch(apiURL(`/api/v1/${name}`));
+  if (!res.ok) throw new Error(`${name}: HTTP ${res.status}`);
+  return res.json();
+}
+
 // Tariff helpers
 function toSegments(entry) {
   return Object.entries(entry)
@@ -27,17 +36,23 @@ function resourceItems(resource) {
   return (resource?.items ?? []).map((item) => item.data);
 }
 
+// resourceItem returns the data payload of the item with the given ID.
+function resourceItem(resource, id) {
+  return (resource?.items ?? []).find((item) => item.id === id)?.data ?? null;
+}
+
 // resourceError returns the resource error, or a fallback when it has no items.
 function resourceError(resource, hasData) {
   return resource?.error || (!hasData ? 'No data' : null);
 }
 
-const parseWeather = (all) => {
-  const resource = all.weather;
-  const data = resourceItems(resource)[0];
-  if (!data) return { data: null, error: resourceError(resource, false) };
+const parseWeather = (resource) => {
+  const current = resourceItem(resource, 'current');
+  const hourly = resourceItem(resource, 'hourly') ?? [];
+  const daily = resourceItem(resource, 'daily') ?? [];
+  if (!current) return { data: null, error: resourceError(resource, false) };
   return {
-    data: formatWeather(data.current ?? null, data.hourly ?? [], data.daily ?? []),
+    data: formatWeather(current, hourly, daily),
     error: resourceError(resource, true),
   };
 };
@@ -138,22 +153,32 @@ function formatWeather(current, hourly, daily) {
   return { current, graph, forecast };
 }
 
-const parseTemperature = (all) => {
-  const resource = all.temperature;
-  const data = resourceItems(resource)[0];
-  if (!data) return { data: null, error: resourceError(resource, false) };
+// median returns the median of a numeric array. Returns null for an empty array.
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+const parseTemperature = (resource) => {
+  // The API already keeps only the recent, valid readings, so aggregate
+  // whatever it returns.
+  const readings = resourceItems(resource);
+  if (!readings.length) return { data: null, error: resourceError(resource, false) };
+
+  const last = readings[readings.length - 1];
   return {
     data: {
-      temperature: data.temperature,
-      humidity: data.humidity,
-      location: data.location ?? null,
+      temperature: median(readings.map((r) => r.temperature)),
+      humidity: median(readings.map((r) => r.humidity)),
+      location: last.location ?? null,
     },
     error: resourceError(resource, true),
   };
 };
 
-const parseTransport = (all) => {
-  const resource = all.transport;
+const parseTransport = (resource) => {
   const stops = resourceItems(resource);
   if (!stops.length) return { data: null, error: resourceError(resource, false) };
   return {
@@ -175,10 +200,10 @@ const parseTransport = (all) => {
   };
 };
 
-function parseElectricity(all) {
-  const resource = all.electricity;
-  const data = resourceItems(resource)[0];
-  if (!data) return { data: null, error: resourceError(resource, false) };
+function parseElectricity(resource) {
+  const daysData = resourceItem(resource, 'days');
+  const monthsData = resourceItem(resource, 'months');
+  if (!daysData && !monthsData) return { data: null, error: resourceError(resource, false) };
 
   const normalize = (entry) => ({
     date: entry.date,
@@ -188,8 +213,8 @@ function parseElectricity(all) {
     buhp: entry.BUHP ?? 0, buhc: entry.BUHC ?? 0,
   });
 
-  const days = (data.days ?? []).slice(-14).map(normalize);
-  const months = (data.months ?? []).slice(-2).map(normalize);
+  const days = (daysData ?? []).slice(-14).map(normalize);
+  const months = (monthsData ?? []).slice(-2).map(normalize);
   return {
     data: formatElectricity(months, days),
     error: resourceError(resource, true),
@@ -237,8 +262,7 @@ function formatElectricity(months, days) {
   return { monthBars, monthMax, dayGroups, dayMax, legend };
 }
 
-const parseTempo = (all) => {
-  const resource = all.tempo;
+const parseTempo = (resource) => {
   const days = resourceItems(resource);
   if (!days.length) return { data: null, error: resourceError(resource, false) };
 
@@ -271,13 +295,19 @@ document.addEventListener('alpine:init', () => {
 
     async refresh() {
       try {
-        const all = await fetch(apiURL('/api/v1/all')).then(r => r.json());
-        this.timestamp = all.timestamp;
-        this.weather = parseWeather(all);
-        this.temperature = parseTemperature(all);
-        this.transport = parseTransport(all);
-        this.electricity = parseElectricity(all);
-        this.tempo = parseTempo(all);
+        const [weather, temperature, transport, electricity, tempo] = await Promise.all([
+          fetchResource('weather'),
+          fetchResource('temperature'),
+          fetchResource('transport'),
+          fetchResource('electricity'),
+          fetchResource('tempo'),
+        ]);
+        this.timestamp = new Date().toISOString();
+        this.weather = parseWeather(weather);
+        this.temperature = parseTemperature(temperature);
+        this.transport = parseTransport(transport);
+        this.electricity = parseElectricity(electricity);
+        this.tempo = parseTempo(tempo);
       } catch (e) {
         console.error('Fetch failed:', e);
       }
@@ -285,7 +315,10 @@ document.addEventListener('alpine:init', () => {
 
     async refreshStop(stopId) {
       try {
-        const stop = await fetch(apiURL(`/api/v1/transport/live?id=${stopId}`)).then(r => r.json());
+        const item = await fetch(apiURL(`/api/v1/transport/${stopId}/refresh`), {
+          method: 'POST',
+        }).then(r => r.json());
+        const stop = item?.data;
         if (stop?.destinations) {
           this.transport.data?.stops?.forEach((row) => {
             if (row.id !== stopId) return;

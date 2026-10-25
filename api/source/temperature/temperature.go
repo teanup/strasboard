@@ -1,19 +1,26 @@
-// Package temperature defines the payload types for indoor sensor readings.
+// Package temperature defines the payload type for indoor sensor readings and
+// the retention policy applied to them.
+//
+// Readings are pushed by the sensor through the generic CRUD endpoint, so the
+// policy is enforced by the HTTP layer rather than a background job.
 package temperature
 
-import (
-	"slices"
-	"time"
-)
+import "time"
 
 // ResourceName is the store resource holding temperature readings.
 const ResourceName = "temperature"
 
-// CurrentID is the derived item ID exposing the aggregated current reading.
-const CurrentID = "current"
+// Retention policy for stored readings.
+const (
+	// Window is how many recent readings are kept. Older readings are pruned
+	// on every write so the resource never grows unbounded.
+	Window = 5
 
-// Window is how many recent readings are aggregated into the current value.
-const Window = 5
+	// MaxAge is how old the newest reading may be before the resource is
+	// considered stale. A stale resource keeps its readings but is flagged
+	// with an error, so clients know the sensor has gone quiet.
+	MaxAge = 1 * time.Hour
+)
 
 // Reading is a single sensor measurement.
 type Reading struct {
@@ -23,44 +30,16 @@ type Reading struct {
 	Location    string    `json:"location"`
 }
 
-// Current is the aggregated value exposed at GET /api/v1/temperature/current.
-type Current struct {
-	Temperature float64 `json:"temperature"`
-	Humidity    float64 `json:"humidity"`
-	Location    string  `json:"location"`
-}
+// StaleError is the message reported when the newest reading is older than
+// MaxAge.
+const StaleError = "no recent reading"
 
-// Aggregate computes the current value from the most recent readings.
-// It returns false if there are no readings.
-func Aggregate(readings []Reading) (Current, bool) {
-	if len(readings) == 0 {
-		return Current{}, false
+// Stale reports whether the newest reading is older than MaxAge. It returns
+// false when there are no readings (an empty resource is not "stale", it is
+// simply empty).
+func Stale(newest time.Time, now time.Time) bool {
+	if newest.IsZero() {
+		return false
 	}
-	if len(readings) > Window {
-		readings = readings[len(readings)-Window:]
-	}
-
-	temps := make([]float64, len(readings))
-	hums := make([]float64, len(readings))
-	for i, r := range readings {
-		temps[i] = r.Temperature
-		hums[i] = r.Humidity
-	}
-
-	return Current{
-		Temperature: median(temps),
-		Humidity:    median(hums),
-		Location:    readings[len(readings)-1].Location,
-	}, true
-}
-
-// median returns the median of a float64 slice. The slice must not be empty.
-func median(vals []float64) float64 {
-	sorted := slices.Clone(vals)
-	slices.Sort(sorted)
-	n := len(sorted)
-	if n%2 == 1 {
-		return sorted[n/2]
-	}
-	return (sorted[n/2-1] + sorted[n/2]) / 2
+	return now.Sub(newest) > MaxAge
 }
