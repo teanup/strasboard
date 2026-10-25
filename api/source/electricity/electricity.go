@@ -1,6 +1,8 @@
+// Package electricity fetches consumption history from the SER API.
 package electricity
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -13,15 +15,25 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"strasboard/api/config"
+	"strasboard/api/httpx"
 )
 
-const (
-	electricityRetryTTL    = 1 * time.Hour
-	electricityRefreshHour = 1
-)
+// apiURL is the SER portal endpoint.
+const apiURL = "https://maconsolinky.strasbourg-electricite-reseaux.fr/efluidES_PORTAIL"
 
-type ElectricitySource struct {
-	apiURL   string
+// refreshHour is the hour at which the previous day's data becomes available.
+const refreshHour = 1
+
+// retryInterval is how long to wait before retrying when data is missing.
+const retryInterval = 1 * time.Hour
+
+// currentID is the fixed item ID for this single-document resource.
+const currentID = "current"
+
+// Source fetches electricity consumption from the SER API.
+type Source struct {
 	clientID string
 	username string
 	password string
@@ -31,10 +43,11 @@ type ElectricitySource struct {
 	accessToken    string
 	tokenExpiry    time.Time
 	servicePointID string
+	lastData       *Data
 }
 
-// API response
-type ElectricityData struct {
+// Data is the electricity payload returned by the API.
+type Data struct {
 	Days   []Consumption `json:"days"`
 	Months []Consumption `json:"months"`
 }
@@ -51,67 +64,76 @@ type Consumption struct {
 	RHP  *int   `json:"RHP,omitempty"`
 }
 
-func NewElectricitySource(cfg *Config) *ElectricitySource {
+func New(cfg *config.Config) *Source {
 	loc, _ := time.LoadLocation("Europe/Paris")
 	if loc == nil {
 		loc = time.Local
 	}
-	return &ElectricitySource{
-		apiURL:   cfg.ElectricityAPIURL,
-		clientID: cfg.ElectricityClientID,
-		username: cfg.ElectricityUsername,
-		password: cfg.ElectricityPassword,
+	return &Source{
+		clientID: cfg.Electricity.ClientID,
+		username: cfg.Electricity.Username,
+		password: cfg.Electricity.Password,
 		loc:      loc,
 	}
 }
 
-func (s *ElectricitySource) Name() string               { return "electricity" }
-func (s *ElectricitySource) DegradedTTL() time.Duration { return 48 * time.Hour }
+func (s *Source) Name() string { return "electricity" }
 
-func (s *ElectricitySource) Fetch() *Response {
+// NextRefresh returns 1 AM once the previous day's data is available, or the
+// retry interval while it is still missing.
+func (s *Source) NextRefresh(now time.Time) time.Time {
+	now = now.In(s.loc)
+
+	s.mu.Lock()
+	hasYesterday := s.hasYesterday(now)
+	s.mu.Unlock()
+
+	if hasYesterday {
+		return time.Date(now.Year(), now.Month(), now.Day()+1, refreshHour, 0, 0, 0, s.loc)
+	}
+	return now.Add(retryInterval)
+}
+
+// hasYesterday reports whether the stored data already includes yesterday.
+func (s *Source) hasYesterday(now time.Time) bool {
+	if s.lastData == nil || len(s.lastData.Days) == 0 {
+		return false
+	}
+	yesterday := now.AddDate(0, 0, -1).Format(time.DateOnly)
+	return s.lastData.Days[len(s.lastData.Days)-1].Date >= yesterday
+}
+
+// Refresh fetches consumption data and returns it as a single item.
+func (s *Source) Refresh(_ context.Context) (map[string]any, error) {
 	if s.username == "" || s.password == "" {
-		return ErrorResponse("electricity not configured", time.Hour)
+		return nil, fmt.Errorf("electricity not configured")
 	}
 
 	data, err := s.fetchData()
 	if err != nil {
-		log.Printf("[electricity] %v", err)
-		return ErrorResponse(err.Error(), 10*time.Minute)
+		return nil, err
 	}
 
-	now := time.Now().In(s.loc)
-	hour := now.Hour()
+	s.mu.Lock()
+	s.lastData = data
+	s.mu.Unlock()
 
-	// Yesterday's data not yet available
-	if hour < electricityRefreshHour {
-		expiresAt := time.Date(now.Year(), now.Month(), now.Day(), electricityRefreshHour, 0, 0, 0, s.loc)
-		return NewResponseUntil(data, expiresAt)
-	}
-	// Check if yesterday's data available
-	yesterday := now.AddDate(0, 0, -1).Format(time.DateOnly)
-	hasYesterday := len(data.Days) > 0 && data.Days[len(data.Days)-1].Date >= yesterday
-	if hasYesterday {
-		expiresAt := time.Date(now.Year(), now.Month(), now.Day(), electricityRefreshHour, 0, 0, 0, s.loc).AddDate(0, 0, 1)
-		return NewResponseUntil(data, expiresAt)
-	}
-	// Retry until data is available
-	return NewResponse(data, electricityRetryTTL)
+	return map[string]any{currentID: data}, nil
 }
 
-// Fetch consumption once authenticated
-func (s *ElectricitySource) fetchData() (*ElectricityData, error) {
+// fetchData fetches consumption once authenticated.
+func (s *Source) fetchData() (*Data, error) {
 	if err := s.ensureAuth(); err != nil {
 		return nil, fmt.Errorf("auth: %w", err)
 	}
 	return s.fetchConsumption()
 }
 
-// Ensure valid access token and service point ID
-func (s *ElectricitySource) ensureAuth() error {
+// ensureAuth ensures a valid access token and service point ID.
+func (s *Source) ensureAuth() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check if token expires soon
 	if s.accessToken != "" && time.Now().Add(5*time.Minute).Before(s.tokenExpiry) {
 		return nil
 	}
@@ -135,7 +157,6 @@ func (s *ElectricitySource) ensureAuth() error {
 
 	log.Printf("[electricity] authenticated (expires in %s)", time.Until(s.tokenExpiry).Round(time.Minute))
 
-	// TODO: check if servicePointID is still valid after token refresh
 	if s.servicePointID == "" {
 		if err := s.fetchServicePoint(); err != nil {
 			return fmt.Errorf("service point: %w", err)
@@ -144,14 +165,14 @@ func (s *ElectricitySource) ensureAuth() error {
 	return nil
 }
 
-// Login and obtain session cookie
-func (s *ElectricitySource) login() (*http.Cookie, error) {
+// login logs in and returns the session cookie.
+func (s *Source) login() (*http.Cookie, error) {
 	var resp struct {
 		Code    string `json:"code"`
 		Libelle string `json:"libelle"`
 	}
 
-	httpResp, err := PostForm(s.apiURL+"/auth/externe/authentification", url.Values{
+	httpResp, err := httpx.PostForm(apiURL+"/auth/externe/authentification", url.Values{
 		"username":  {s.username},
 		"password":  {s.password},
 		"client_id": {s.clientID},
@@ -172,8 +193,8 @@ func (s *ElectricitySource) login() (*http.Cookie, error) {
 	return nil, fmt.Errorf("no session cookie")
 }
 
-// Obtain authorization code
-func (s *ElectricitySource) authorize(cookie *http.Cookie, challenge string) (string, error) {
+// authorize obtains an authorization code.
+func (s *Source) authorize(cookie *http.Cookie, challenge string) (string, error) {
 	query := url.Values{
 		"response_type":         {"code"},
 		"code_challenge":        {challenge},
@@ -181,7 +202,7 @@ func (s *ElectricitySource) authorize(cookie *http.Cookie, challenge string) (st
 		"client_id":             {s.clientID},
 	}
 
-	httpResp, err := GetRedirect(s.apiURL+"/auth/authorize-internet", query, nil, []*http.Cookie{cookie})
+	httpResp, err := httpx.GetRedirect(apiURL+"/auth/authorize-internet", query, nil, []*http.Cookie{cookie})
 	if err != nil {
 		return "", err
 	}
@@ -203,8 +224,8 @@ func (s *ElectricitySource) authorize(cookie *http.Cookie, challenge string) (st
 	return code, nil
 }
 
-// Exchange authorization code for access token
-func (s *ElectricitySource) exchangeToken(code, verifier string) error {
+// exchangeToken exchanges an authorization code for an access token.
+func (s *Source) exchangeToken(code, verifier string) error {
 	var resp struct {
 		AccessToken string `json:"access_token"`
 		TokenType   string `json:"token_type"`
@@ -212,7 +233,7 @@ func (s *ElectricitySource) exchangeToken(code, verifier string) error {
 		Error       string `json:"error"`
 	}
 
-	if _, err := PostForm(s.apiURL+"/auth/tokenUtilisateurInternet", url.Values{
+	if _, err := httpx.PostForm(apiURL+"/auth/tokenUtilisateurInternet", url.Values{
 		"client_id":     {s.clientID},
 		"code":          {code},
 		"grant_type":    {"authorization_code"},
@@ -230,8 +251,8 @@ func (s *ElectricitySource) exchangeToken(code, verifier string) error {
 	return nil
 }
 
-// Fetch service point ID (Point De Livraison)
-func (s *ElectricitySource) fetchServicePoint() error {
+// fetchServicePoint fetches the service point ID (Point De Livraison).
+func (s *Source) fetchServicePoint() error {
 	var resp []struct {
 		ID             string `json:"id"`
 		PointDeService struct {
@@ -241,7 +262,7 @@ func (s *ElectricitySource) fetchServicePoint() error {
 
 	query := url.Values{"expand": {"pointDeService"}}
 	headers := http.Header{"Authorization": {s.accessToken}}
-	if _, err := GetJSON(s.apiURL+"/rest/produits/pointsAccesServicesClient", query, headers, nil, &resp, nil); err != nil {
+	if _, err := httpx.GetJSON(apiURL+"/rest/produits/pointsAccesServicesClient", query, headers, nil, &resp, nil); err != nil {
 		return err
 	}
 
@@ -254,7 +275,7 @@ func (s *ElectricitySource) fetchServicePoint() error {
 	return nil
 }
 
-// Consumption period from API response
+// consumptionPeriod is a consumption period from the API response.
 type consumptionPeriod struct {
 	BlocFournisseur struct {
 		PostesHorosaisonnier []struct {
@@ -274,8 +295,8 @@ type consumptionPeriod struct {
 	} `json:"blocFournisseur"`
 }
 
-// Fetch electricity consumption data
-func (s *ElectricitySource) fetchConsumption() (*ElectricityData, error) {
+// fetchConsumption fetches electricity consumption data.
+func (s *Source) fetchConsumption() (*Data, error) {
 	now := time.Now()
 	start := time.Date(now.Year(), now.Month()-2, 0, 0, 0, 0, 0, time.Local)
 	end := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.Local)
@@ -297,9 +318,9 @@ func (s *ElectricitySource) fetchConsumption() (*ElectricityData, error) {
 		PeriodesActivite []consumptionPeriod `json:"periodesActivite"`
 	}
 
-	reqURL := s.apiURL + "/rest/interfaces/" + strings.ToLower(s.clientID) + "/historiqueDeMesure"
+	reqURL := apiURL + "/rest/interfaces/" + strings.ToLower(s.clientID) + "/historiqueDeMesure"
 	headers := http.Header{"Authorization": {s.accessToken}}
-	if _, err := PostJSON(reqURL, payload, headers, nil, &resp, checkErrSER); err != nil {
+	if _, err := httpx.PostJSON(reqURL, payload, headers, nil, &resp, checkErrSER); err != nil {
 		return nil, err
 	}
 
@@ -310,8 +331,8 @@ func (s *ElectricitySource) fetchConsumption() (*ElectricityData, error) {
 	return s.parseConsumption(resp.PeriodesActivite), nil
 }
 
-// Parse consumption data from API response
-func (s *ElectricitySource) parseConsumption(contracts []consumptionPeriod) *ElectricityData {
+// parseConsumption parses consumption data from the API response.
+func (s *Source) parseConsumption(contracts []consumptionPeriod) *Data {
 	daily := make(map[string]map[string]float64)
 	monthly := make(map[string]map[string]float64)
 
@@ -347,13 +368,13 @@ func (s *ElectricitySource) parseConsumption(contracts []consumptionPeriod) *Ele
 		}
 	}
 
-	return &ElectricityData{
+	return &Data{
 		Days:   aggregateConsumption(daily, 14),
 		Months: aggregateConsumption(monthly, 2),
 	}
 }
 
-// Generate PKCE verifier and challenge
+// generatePKCE generates a PKCE verifier and challenge.
 func generatePKCE() (verifier, challenge string) {
 	b := make([]byte, 32)
 	rand.Read(b)
@@ -363,7 +384,7 @@ func generatePKCE() (verifier, challenge string) {
 	return
 }
 
-// Aggregate consumption data into sorted slice with limit
+// aggregateConsumption aggregates consumption data into a sorted slice with a limit.
 func aggregateConsumption(m map[string]map[string]float64, limit int) []Consumption {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -407,7 +428,7 @@ func aggregateConsumption(m map[string]map[string]float64, limit int) []Consumpt
 	return result
 }
 
-// Check for error in SER response
+// checkErrSER returns an error if the SER response reports one.
 func checkErrSER(body []byte) error {
 	var resp struct {
 		MessagesInformatifs []string `json:"messagesInformatifs"`

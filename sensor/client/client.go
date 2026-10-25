@@ -24,7 +24,7 @@ type Client struct {
 	http      *http.Client
 }
 
-// New returns a Client posting to url, optionally authenticating with a bearer token.
+// New returns a Client posting to url, optionally authenticating with a token.
 func New(url, authToken string) *Client {
 	return &Client{
 		url:       url,
@@ -51,7 +51,7 @@ func (c *Client) Post(r Reading) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+c.authToken)
+		req.Header.Set("Authorization", c.authToken)
 	}
 
 	resp, err := c.http.Do(req)

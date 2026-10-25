@@ -36,24 +36,22 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 
-	cfg := defaults()
-	if err := json.Unmarshal(data, cfg); err != nil {
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 
-	if cfg.ServerURL == "" {
-		return nil, fmt.Errorf("server_url not set")
-	}
 	if cfg.Pin == "" {
 		return nil, fmt.Errorf("pin not set")
 	}
-	return cfg, nil
-}
-
-// defaults returns a configuration with sensible values for optional fields.
-func defaults() *Config {
-	return &Config{
-		ReadIntervalSecs: 5,
-		MaxRetries:       11,
+	if cfg.ServerURL == "" {
+		return nil, fmt.Errorf("server_url not set")
 	}
+	if cfg.ReadIntervalSecs <= 0 {
+		return nil, fmt.Errorf("read_interval_seconds not set")
+	}
+	if cfg.MaxRetries <= 0 {
+		return nil, fmt.Errorf("max_retries not set")
+	}
+	return &cfg, nil
 }

@@ -1,96 +1,57 @@
+// Package temperature defines the payload types for indoor sensor readings.
 package temperature
 
 import (
-	"encoding/json"
-	"log"
-	"net/http"
 	"slices"
-	"sync"
 	"time"
 )
 
-const temperatureBufSize = 5
+// ResourceName is the store resource holding temperature readings.
+const ResourceName = "temperature"
 
-// TemperatureSource receives push data from the sensor and serves
-// the median of the last few readings.
-type TemperatureSource struct {
-	mu       sync.RWMutex
-	temps    []float64
-	hums     []float64
-	location string
-	lastPush time.Time
+// CurrentID is the derived item ID exposing the aggregated current reading.
+const CurrentID = "current"
+
+// Window is how many recent readings are aggregated into the current value.
+const Window = 5
+
+// Reading is a single sensor measurement.
+type Reading struct {
+	Time        time.Time `json:"time"`
+	Temperature float64   `json:"temperature"`
+	Humidity    float64   `json:"humidity"`
+	Location    string    `json:"location"`
 }
 
-// TemperaturePayload is the JSON body sent by the sensor.
-type TemperaturePayload struct {
+// Current is the aggregated value exposed at GET /api/v1/temperature/current.
+type Current struct {
 	Temperature float64 `json:"temperature"`
 	Humidity    float64 `json:"humidity"`
 	Location    string  `json:"location"`
 }
 
-// TemperatureData is returned in API responses.
-type TemperatureData struct {
-	Temperature float64 `json:"temperature"`
-	Humidity    float64 `json:"humidity"`
-	Location    string  `json:"location"`
-}
-
-func NewTemperatureSource(_ *Config) *TemperatureSource {
-	return &TemperatureSource{}
-}
-
-func (s *TemperatureSource) Name() string               { return "temperature" }
-func (s *TemperatureSource) DegradedTTL() time.Duration { return 4 * time.Hour }
-
-// Fetch returns the median reading or an error if no data is available.
-func (s *TemperatureSource) Fetch() *Response {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	n := len(s.temps)
-	if n == 0 {
-		return ErrorResponse("no sensor data", 30*time.Second)
+// Aggregate computes the current value from the most recent readings.
+// It returns false if there are no readings.
+func Aggregate(readings []Reading) (Current, bool) {
+	if len(readings) == 0 {
+		return Current{}, false
+	}
+	if len(readings) > Window {
+		readings = readings[len(readings)-Window:]
 	}
 
-	return NewResponse(TemperatureData{
-		Temperature: median(s.temps),
-		Humidity:    median(s.hums),
-		Location:    s.location,
-	}, 30*time.Second)
-}
-
-// HandlePush returns an HTTP handler that accepts POST data from the sensor.
-func (s *TemperatureSource) HandlePush() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var p TemperaturePayload
-		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-
-		s.push(p)
-		log.Printf("temperature: received %.1f °C, %.1f %% (%s)", p.Temperature, p.Humidity, p.Location)
-		w.WriteHeader(http.StatusNoContent)
+	temps := make([]float64, len(readings))
+	hums := make([]float64, len(readings))
+	for i, r := range readings {
+		temps[i] = r.Temperature
+		hums[i] = r.Humidity
 	}
-}
 
-func (s *TemperatureSource) push(p TemperaturePayload) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.temps = append(s.temps, p.Temperature)
-	s.hums = append(s.hums, p.Humidity)
-	if len(s.temps) > temperatureBufSize {
-		s.temps = s.temps[1:]
-		s.hums = s.hums[1:]
-	}
-	s.location = p.Location
-	s.lastPush = time.Now()
+	return Current{
+		Temperature: median(temps),
+		Humidity:    median(hums),
+		Location:    readings[len(readings)-1].Location,
+	}, true
 }
 
 // median returns the median of a float64 slice. The slice must not be empty.

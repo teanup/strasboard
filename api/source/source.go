@@ -1,62 +1,28 @@
+// Package source defines the contract between external data sources and the
+// background jobs that refresh them.
 package source
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
-type Source interface {
+// Resource is a named, refreshable collection of items.
+//
+// Items are keyed by a string ID. Single-document resources (such as the
+// weather forecast) return a single item with a fixed ID such as "current".
+type Resource interface {
+	// Name is the resource key used in URLs and the store, e.g. "weather".
 	Name() string
-	Fetch() *Response
-	DegradedTTL() time.Duration
-}
 
-type Response struct {
-	Data      any       `json:"data,omitempty"`
-	Timestamp string    `json:"timestamp"`
-	Error     string    `json:"error,omitempty"`
-	ExpiresAt time.Time `json:"-"`
-}
+	// NextRefresh returns when the resource next needs to be refreshed. The
+	// scheduler sleeps until then, so a source can avoid polling when its data
+	// cannot change (e.g. electricity data only arrives once a day).
+	NextRefresh(now time.Time) time.Time
 
-// Create a successful response with TTL
-func NewResponse(data any, ttl time.Duration) *Response {
-	return &Response{
-		Data:      data,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		ExpiresAt: time.Now().Add(ttl),
-	}
-}
-
-// Create a successful response with explicit expiration time
-func NewResponseUntil(data any, expiresAt time.Time) *Response {
-	return &Response{
-		Data:      data,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		ExpiresAt: expiresAt,
-	}
-}
-
-// Create an error response
-func ErrorResponse(msg string, ttl time.Duration) *Response {
-	return &Response{
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Error:     msg,
-		ExpiresAt: time.Now().Add(ttl),
-	}
-}
-
-// Create a backup response from a successful response with degraded TTL
-func BackupResponse(original *Response, degradedTTL time.Duration) *Response {
-	return &Response{
-		Data:      original.Data,
-		Timestamp: original.Timestamp,
-		ExpiresAt: time.Now().Add(degradedTTL),
-	}
-}
-
-// Create a degraded response combining backup data with error info
-func DegradedResponse(backup *Response, err *Response) *Response {
-	return &Response{
-		Data:      backup.Data,
-		Timestamp: backup.Timestamp,
-		Error:     err.Error,
-		ExpiresAt: err.ExpiresAt,
-	}
+	// Refresh fetches data from the external source and returns the items to
+	// publish, keyed by item ID. It must not be called concurrently with
+	// itself. Returning an error leaves the previously stored items in place
+	// (degraded mode).
+	Refresh(ctx context.Context) (map[string]any, error)
 }

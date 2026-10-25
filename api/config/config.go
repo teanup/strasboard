@@ -1,71 +1,89 @@
+// Package config loads the API configuration from a JSON file.
 package config
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
-	"strconv"
+	"time"
 )
 
+// Config is the root configuration.
 type Config struct {
-	Port string
-
-	WeatherAPIURL    string
-	WeatherLatitude  float64
-	WeatherLongitude float64
-	WeatherTimezone  string
-
-	TransportAPIURL string
-	TransportAPIKey string
-	TransportStops  string
-
-	ElectricityAPIURL   string
-	ElectricityClientID string
-	ElectricityUsername string
-	ElectricityPassword string
-
-	TempoAPIURL    string
-	TempoAuthURL   string
-	TempoAuthToken string
+	CORS        CORS        `json:"cors"`
+	Snapshot    Snapshot    `json:"snapshot"`
+	Weather     Weather     `json:"weather"`
+	Transport   Transport   `json:"transport"`
+	Electricity Electricity `json:"electricity"`
+	Tempo       Tempo       `json:"tempo"`
 }
 
-// Read environment variables
-func LoadConfig() *Config {
-	return &Config{
-		Port: getEnv("PORT", "80"),
-
-		WeatherAPIURL:    getEnv("WEATHER_API_URL", ""),
-		WeatherLatitude:  getEnvFloat("WEATHER_LATITUDE", 48.58),
-		WeatherLongitude: getEnvFloat("WEATHER_LONGITUDE", 7.75),
-		WeatherTimezone:  getEnv("WEATHER_TIMEZONE", "Europe/Paris"),
-
-		TransportAPIURL: getEnv("TRANSPORT_API_URL", ""),
-		TransportAPIKey: getEnv("TRANSPORT_API_KEY", ""),
-		TransportStops:  getEnv("TRANSPORT_STOPS", ""),
-
-		ElectricityAPIURL:   getEnv("ELECTRICITY_API_URL", ""),
-		ElectricityClientID: getEnv("ELECTRICITY_CLIENT_ID", ""),
-		ElectricityUsername: getEnv("ELECTRICITY_USERNAME", ""),
-		ElectricityPassword: getEnv("ELECTRICITY_PASSWORD", ""),
-
-		TempoAPIURL:    getEnv("TEMPO_API_URL", ""),
-		TempoAuthURL:   getEnv("TEMPO_AUTH_URL", ""),
-		TempoAuthToken: getEnv("TEMPO_AUTH_TOKEN", ""),
-	}
+// CORS configures cross-origin access for the separately hosted front-end.
+type CORS struct {
+	AllowedOrigins []string `json:"allowed_origins"`
 }
 
-// Get a string env variable
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
+// Snapshot configures persistence of the store.
+type Snapshot struct {
+	Path            string `json:"path"`
+	IntervalMinutes int    `json:"interval_minutes"`
 }
 
-// Get a float env variable
-func getEnvFloat(key string, defaultValue float64) float64 {
-	if value := os.Getenv(key); value != "" {
-		if f, err := strconv.ParseFloat(value, 64); err == nil {
-			return f
-		}
+// Weather configures the Open-Meteo source.
+type Weather struct {
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+	Timezone  string  `json:"timezone"`
+}
+
+// Transport configures the CTS source.
+type Transport struct {
+	APIKey string `json:"api_key"`
+	Stops  string `json:"stops"`
+}
+
+// Electricity configures the SER source.
+type Electricity struct {
+	ClientID string `json:"client_id"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// Tempo configures the RTE Tempo source.
+type Tempo struct {
+	AuthToken string `json:"auth_token"`
+}
+
+// SnapshotInterval returns the snapshot interval as a duration.
+func (c *Config) SnapshotInterval() time.Duration {
+	return time.Duration(c.Snapshot.IntervalMinutes) * time.Minute
+}
+
+// Load reads the configuration file and validates required fields.
+func Load() (*Config, error) {
+	path := os.Getenv("CONFIG_PATH")
+	if path == "" {
+		path = "/etc/strasboard/api.json"
 	}
-	return defaultValue
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	if cfg.Snapshot.Path == "" {
+		return nil, fmt.Errorf("snapshot.path not set")
+	}
+	if cfg.Snapshot.IntervalMinutes <= 0 {
+		return nil, fmt.Errorf("snapshot.interval_minutes not set")
+	}
+	if cfg.Weather.Timezone == "" {
+		return nil, fmt.Errorf("weather.timezone not set")
+	}
+	return &cfg, nil
 }

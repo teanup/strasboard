@@ -1,82 +1,116 @@
+// Package tempo fetches the EDF Tempo tariff calendar from RTE.
 package tempo
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
+
+	"strasboard/api/config"
+	"strasboard/api/httpx"
 )
 
+// apiURL and authURL are the RTE Tempo endpoints.
 const (
-	tempoRetryTTL        = 1 * time.Hour
-	tempoProvisionalHour = 8
-	tempoDefinitiveHour  = 11
+	apiURL  = "https://digital.iservices.rte-france.com/open_api/tempo_like_supply_contract/v1"
+	authURL = "https://digital.iservices.rte-france.com/token/oauth/"
 )
 
-type TempoSource struct {
-	apiURL    string
-	authURL   string
+// The next day's color is published provisionally at provisionalHour and
+// becomes definitive at definitiveHour.
+const (
+	provisionalHour = 8
+	definitiveHour  = 11
+)
+
+// retryInterval is how long to wait before retrying while the next day's
+// color is still provisional.
+const retryInterval = 1 * time.Hour
+
+// Source fetches the EDF Tempo calendar from RTE.
+type Source struct {
 	authToken string
 	loc       *time.Location
+
+	mu       sync.Mutex
+	lastDays []Day
 }
 
-// API response
-type TempoData []TempoDay
-
-type TempoDay struct {
+// Day is a single day of the Tempo calendar.
+type Day struct {
 	Date  string `json:"date"`
 	Color string `json:"color"`
 }
 
-func NewTempoSource(cfg *Config) *TempoSource {
+func New(cfg *config.Config) *Source {
 	loc, _ := time.LoadLocation("Europe/Paris")
 	if loc == nil {
 		loc = time.Local
 	}
-	return &TempoSource{
-		apiURL:    cfg.TempoAPIURL,
-		authURL:   cfg.TempoAuthURL,
-		authToken: cfg.TempoAuthToken,
+	return &Source{
+		authToken: cfg.Tempo.AuthToken,
 		loc:       loc,
 	}
 }
 
-func (s *TempoSource) Name() string               { return "tempo" }
-func (s *TempoSource) DegradedTTL() time.Duration { return 24 * time.Hour }
+func (s *Source) Name() string { return "tempo" }
 
-func (s *TempoSource) Fetch() *Response {
-	if s.authToken == "" {
-		return ErrorResponse("tempo not configured", time.Hour)
-	}
+// NextRefresh returns the next time the calendar can change: the provisional
+// hour while tomorrow's color is still provisional, otherwise the provisional
+// hour the next day.
+func (s *Source) NextRefresh(now time.Time) time.Time {
+	now = now.In(s.loc)
 
-	data, err := s.fetchData()
-	if err != nil {
-		log.Printf("[tempo] %v", err)
-		return ErrorResponse(err.Error(), 10*time.Minute)
-	}
+	s.mu.Lock()
+	provisional := s.hasTomorrow(now)
+	s.mu.Unlock()
 
-	now := time.Now().In(s.loc)
-	hour := now.Hour()
-
-	// Tomorrow's data not yet available
-	if hour < tempoProvisionalHour {
-		expiresAt := time.Date(now.Year(), now.Month(), now.Day(), tempoProvisionalHour, 0, 0, 0, s.loc)
-		return NewResponseUntil(data, expiresAt)
+	if provisional && now.Hour() < definitiveHour {
+		return now.Add(retryInterval)
 	}
-	// Tomorrow's data should be available
-	if hour >= tempoDefinitiveHour {
-		expiresAt := time.Date(now.Year(), now.Month(), now.Day(), tempoProvisionalHour, 0, 0, 0, s.loc).AddDate(0, 0, 1)
-		return NewResponseUntil(data, expiresAt)
-	}
-	// Retry until data is definitive
-	return NewResponse(data, tempoRetryTTL)
+	return time.Date(now.Year(), now.Month(), now.Day()+1, provisionalHour, 0, 0, 0, s.loc)
 }
 
-// Fetch tempo data from RTE
-func (s *TempoSource) fetchData() (TempoData, error) {
+// hasTomorrow reports whether the stored calendar already includes tomorrow.
+func (s *Source) hasTomorrow(now time.Time) bool {
+	tomorrow := now.AddDate(0, 0, 1).Format(time.DateOnly)
+	for _, d := range s.lastDays {
+		if d.Date >= tomorrow {
+			return true
+		}
+	}
+	return false
+}
+
+// Refresh fetches the calendar and returns one item per day keyed by date.
+func (s *Source) Refresh(_ context.Context) (map[string]any, error) {
+	if s.authToken == "" {
+		return nil, fmt.Errorf("tempo not configured")
+	}
+
+	days, err := s.fetchData()
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	s.lastDays = days
+	s.mu.Unlock()
+
+	items := make(map[string]any, len(days))
+	for _, d := range days {
+		items[d.Date] = d
+	}
+	return items, nil
+}
+
+// fetchData fetches the Tempo calendar from RTE.
+func (s *Source) fetchData() ([]Day, error) {
 	token, err := s.authenticate()
 	if err != nil {
 		return nil, fmt.Errorf("auth: %w", err)
@@ -100,7 +134,7 @@ func (s *TempoSource) fetchData() (TempoData, error) {
 		"end_date":   {endDate.Format(time.RFC3339)},
 	}
 	headers := http.Header{"Authorization": {"Bearer " + token}}
-	if _, err := GetJSON(s.apiURL+"/tempo_like_calendars", query, headers, nil, &resp, checkErrRTE); err != nil {
+	if _, err := httpx.GetJSON(apiURL+"/tempo_like_calendars", query, headers, nil, &resp, checkErrRTE); err != nil {
 		return nil, err
 	}
 
@@ -108,9 +142,9 @@ func (s *TempoSource) fetchData() (TempoData, error) {
 		return nil, fmt.Errorf("no tempo data")
 	}
 
-	data := make(TempoData, 0, len(resp.TempoLikeCalendars.Values))
+	data := make([]Day, 0, len(resp.TempoLikeCalendars.Values))
 	for _, v := range resp.TempoLikeCalendars.Values {
-		data = append(data, TempoDay{
+		data = append(data, Day{
 			Date:  v.StartDate[:10],
 			Color: strings.ToLower(v.Value),
 		})
@@ -118,14 +152,14 @@ func (s *TempoSource) fetchData() (TempoData, error) {
 	return data, nil
 }
 
-// Authenticate and obtain access token
-func (s *TempoSource) authenticate() (string, error) {
+// authenticate authenticates and returns an access token.
+func (s *Source) authenticate() (string, error) {
 	var resp struct {
 		AccessToken string `json:"access_token"`
 	}
 
 	headers := http.Header{"Authorization": {"Basic " + s.authToken}}
-	if _, err := PostJSON(s.authURL, nil, headers, nil, &resp, nil); err != nil {
+	if _, err := httpx.PostJSON(authURL, nil, headers, nil, &resp, nil); err != nil {
 		return "", err
 	}
 
@@ -135,7 +169,7 @@ func (s *TempoSource) authenticate() (string, error) {
 	return resp.AccessToken, nil
 }
 
-// Check for error in RTE response
+// checkErrRTE returns an error if the RTE response reports one.
 func checkErrRTE(body []byte) error {
 	var resp struct {
 		Error       string `json:"error"`

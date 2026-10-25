@@ -1,0 +1,26 @@
+{
+  "cors": {
+    "allowed_origins": ["https://strasboard.lag.tf"]
+  },
+  "snapshot": {
+    "path": "/data/snapshot.json",
+    "interval_minutes": 10
+  },
+  "weather": {
+    "latitude": 48.58,
+    "longitude": 7.75,
+    "timezone": "Europe/Paris"
+  },
+  "transport": {
+    "api_key": "",
+    "stops": "C,Gare,Neuhof;B,Alt Winmärik,Lingolsheim"
+  },
+  "electricity": {
+    "client_id": "",
+    "username": "",
+    "password": ""
+  },
+  "tempo": {
+    "auth_token": ""
+  }
+}
